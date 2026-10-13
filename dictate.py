@@ -52,14 +52,26 @@ QUIET_BLOCKS_NEEDED = 3  # ~300ms of quiet confirms a real pause, not a plosive 
 # mode. If cuts land wrong for your mic, this is the first number to adjust.
 QUIET_RMS_THRESHOLD = 0.004
 
-# Whistle (like most STT models) hallucinates a stock phrase — "Thank you.",
-# "Thanks for watching!" — on near-silent audio instead of returning empty.
-# normalize_audio() makes this worse on its own: it boosts ANY peak toward
-# 0.9, so pure mic noise with no real voice gets scaled up to look just as
-# "loud" as real quiet speech. Checking the RAW (pre-normalization) peak
-# against this threshold is what actually distinguishes "nothing was said"
-# from "something quiet was said" — skip calling the model at all below it.
-MIN_SIGNAL_PEAK = 0.01
+# Whistle (like most STT models) hallucinates a stock phrase ("Thank you.",
+# "Bye.", "you") on audio with no real speech instead of returning empty.
+# A whole-chunk peak threshold does not catch this: a single transient
+# block anywhere in the clip (a tap, a cough, the mic bumping) passes any
+# peak threshold exactly as easily as real speech does, since peak only
+# ever looks at the single loudest sample in the whole chunk. What actually
+# distinguishes speech from a transient is duration: speech holds energy
+# across many consecutive blocks, a transient does not. Count blocks whose
+# RMS clears this threshold and only transcribe once enough of them do.
+VOICED_RMS_THRESHOLD = 0.01
+MIN_VOICED_BLOCKS = 3  # ~300ms of sustained energy, not a single spike
+
+
+def count_voiced_blocks(samples: np.ndarray) -> int:
+    usable_len = (len(samples) // BLOCK_SIZE) * BLOCK_SIZE
+    if usable_len == 0:
+        return 0
+    blocks = samples[:usable_len].reshape(-1, BLOCK_SIZE)
+    block_rms = np.sqrt(np.mean(blocks**2, axis=1))
+    return int(np.sum(block_rms > VOICED_RMS_THRESHOLD))
 
 HISTORY_DIR = Path(__file__).resolve().parent / "history"
 TRANSCRIPTS_LOG = HISTORY_DIR / "transcripts.jsonl"
@@ -279,9 +291,10 @@ class ChunkWorker:
             rms = float(np.sqrt(np.mean(samples**2))) if len(samples) else 0.0
             wav_path = session.dir / f"chunk_{index:03d}.wav"
             text = ""
-            if peak < MIN_SIGNAL_PEAK:
+            voiced_blocks = count_voiced_blocks(samples)
+            if voiced_blocks < MIN_VOICED_BLOCKS:
                 print(f"[dictate] chunk {index} ({duration:.1f}s): skipped, "
-                      f"no real signal (peak={peak:.4f})")
+                      f"only {voiced_blocks} voiced block(s)")
                 save_wav(wav_path, samples)  # keep in history for debugging
             else:
                 try:
@@ -339,9 +352,10 @@ class RecordingSession:
         The very first block of a fresh stream carries a startup transient
         on this hardware (measured peak 0.18-0.62, confirmed across
         repeated trials) that dwarfs the real noise floor (peak 0.003-0.02)
-        for the rest of the recording. Left in, it makes a silent chunk's
-        whole-chunk max look like real signal and defeats MIN_SIGNAL_PEAK
-        entirely. Drop it outright rather than trying to filter it later."""
+        for the rest of the recording. Left in, it would count as one
+        voiced block toward MIN_VOICED_BLOCKS on every single recording,
+        for free, regardless of whether anyone said anything. Drop it
+        outright rather than trying to filter it later."""
         if not self.dropped_startup_block:
             self.dropped_startup_block = True
             return None

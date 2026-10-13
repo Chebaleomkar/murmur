@@ -52,6 +52,15 @@ QUIET_BLOCKS_NEEDED = 3  # ~300ms of quiet confirms a real pause, not a plosive 
 # mode. If cuts land wrong for your mic, this is the first number to adjust.
 QUIET_RMS_THRESHOLD = 0.004
 
+# Whistle (like most STT models) hallucinates a stock phrase — "Thank you.",
+# "Thanks for watching!" — on near-silent audio instead of returning empty.
+# normalize_audio() makes this worse on its own: it boosts ANY peak toward
+# 0.9, so pure mic noise with no real voice gets scaled up to look just as
+# "loud" as real quiet speech. Checking the RAW (pre-normalization) peak
+# against this threshold is what actually distinguishes "nothing was said"
+# from "something quiet was said" — skip calling the model at all below it.
+MIN_SIGNAL_PEAK = 0.01
+
 HISTORY_DIR = Path(__file__).resolve().parent / "history"
 TRANSCRIPTS_LOG = HISTORY_DIR / "transcripts.jsonl"
 
@@ -270,12 +279,17 @@ class ChunkWorker:
             rms = float(np.sqrt(np.mean(samples**2))) if len(samples) else 0.0
             wav_path = session.dir / f"chunk_{index:03d}.wav"
             text = ""
-            try:
-                save_wav(wav_path, samples)
-                text = transcribe(wav_path)
-                print(f"[dictate] chunk {index} ({duration:.1f}s): {text!r}")
-            except Exception as e:
-                print(f"[dictate] chunk {index} ERROR: {e}")
+            if peak < MIN_SIGNAL_PEAK:
+                print(f"[dictate] chunk {index} ({duration:.1f}s): skipped, "
+                      f"no real signal (peak={peak:.4f})")
+                save_wav(wav_path, samples)  # keep in history for debugging
+            else:
+                try:
+                    save_wav(wav_path, samples)
+                    text = transcribe(wav_path)
+                    print(f"[dictate] chunk {index} ({duration:.1f}s): {text!r}")
+                except Exception as e:
+                    print(f"[dictate] chunk {index} ERROR: {e}")
             log_history({
                 "ts": dt.datetime.now().isoformat(timespec="seconds"),
                 "session": session.id,

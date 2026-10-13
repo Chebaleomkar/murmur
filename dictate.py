@@ -329,11 +329,23 @@ class RecordingSession:
         self.pending_count = 0
         self.finished = False
         self.all_done = threading.Event()
+        self.dropped_startup_block = False
 
     def add_block(self, block: np.ndarray):
         """Called from the mic callback thread for every ~100ms block.
         Returns a chunk's samples to transcribe if a cut point was found,
-        else None."""
+        else None.
+
+        The very first block of a fresh stream carries a startup transient
+        on this hardware (measured peak 0.18-0.62, confirmed across
+        repeated trials) that dwarfs the real noise floor (peak 0.003-0.02)
+        for the rest of the recording. Left in, it makes a silent chunk's
+        whole-chunk max look like real signal and defeats MIN_SIGNAL_PEAK
+        entirely. Drop it outright rather than trying to filter it later."""
+        if not self.dropped_startup_block:
+            self.dropped_startup_block = True
+            return None
+
         block_rms = float(np.sqrt(np.mean(block**2))) if len(block) else 0.0
         live_rms.append(block_rms)
 

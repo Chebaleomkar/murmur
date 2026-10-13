@@ -19,6 +19,7 @@ history/transcripts.jsonl, for building a personal dataset over time.
 import collections
 import datetime as dt
 import json
+import math
 import queue
 import subprocess
 import threading
@@ -79,18 +80,19 @@ def log_history(entry: dict) -> None:
         print(f"[dictate] history logging failed (non-fatal): {e}")
 
 
-OVERLAY_W, OVERLAY_H = 260, 70
+OVERLAY_W, OVERLAY_H = 108, 30  # small chip, not a panel — WhisperFlow/Handy-sized
+OVERLAY_RADIUS = OVERLAY_H // 2  # true pill/stadium shape, not just rounded corners
 OVERLAY_CHROMA = "#ff00ff"  # arbitrary color keyed transparent; must never
 # appear in anything actually drawn, or that pixel becomes see-through too.
 OVERLAY_BG = "#1e1e1e"
 
 
 class Overlay:
-    """Tiny always-on-top waveform window with rounded corners. Runs on its
-    own Tk mainloop thread so it never blocks hotkey handling or
-    transcription. True rounded corners (not a rounded shape on a square
-    window) via -transparentcolor: everything outside the drawn rounded
-    rect is the chroma color, which Windows renders as see-through."""
+    """Tiny always-on-top pill-shaped indicator. Runs on its own Tk mainloop
+    thread so it never blocks hotkey handling or transcription. True rounded
+    corners (not a rounded shape on a square window) via -transparentcolor:
+    everything outside the drawn pill is the chroma color, which Windows
+    renders as see-through."""
 
     def __init__(self):
         self._mode_queue: "queue.Queue[tuple[str, str]]" = queue.Queue()
@@ -135,35 +137,42 @@ class Overlay:
         ]
         return self.canvas.create_polygon(points, smooth=True, **kwargs)
 
+    BAR_COUNT = 7
+
     def _draw(self):
         self.canvas.delete("all")
-        self._round_rect(2, 2, OVERLAY_W - 2, OVERLAY_H - 2, 18, fill=OVERLAY_BG)
+        self._round_rect(1, 1, OVERLAY_W - 1, OVERLAY_H - 1, OVERLAY_RADIUS, fill=OVERLAY_BG)
 
         if self.mode == "listening":
-            levels = list(live_rms)
+            levels = list(live_rms)[-self.BAR_COUNT:]
             n = len(levels)
             if n:
-                bar_w = (OVERLAY_W - 32) / n
+                gap = 3
+                bar_w = (OVERLAY_W - 20 - gap * (n - 1)) / n
                 peak = max(max(levels), QUIET_RMS_THRESHOLD * 2)
                 for i, lvl in enumerate(levels):
-                    h = min(1.0, lvl / peak) * (OVERLAY_H - 28) + 2
+                    h = min(1.0, lvl / peak) * (OVERLAY_H - 12) + 3
                     active = lvl > QUIET_RMS_THRESHOLD
-                    color = "#4fd1c5" if active else "#4a4a4a"
-                    x0 = 16 + i * bar_w
+                    color = "#4fd1c5" if active else "#5a5a5a"
+                    x0 = 10 + i * (bar_w + gap)
                     self.canvas.create_rectangle(
                         x0, OVERLAY_H / 2 - h / 2,
-                        x0 + bar_w * 0.7, OVERLAY_H / 2 + h / 2,
+                        x0 + bar_w, OVERLAY_H / 2 + h / 2,
                         fill=color, outline="",
                     )
         elif self.mode == "transcribing":
-            self.canvas.create_text(
-                OVERLAY_W / 2, OVERLAY_H / 2, text="⏳ transcribing…",
-                fill="white", font=("Segoe UI", 11, "bold"),
+            # Small pulsing dot — a spinner would need more room than this
+            # chip has.
+            pulse = (time.time() * 3) % (2 * math.pi)
+            r = 4 + 2 * abs(math.sin(pulse))
+            cx, cy = OVERLAY_W / 2, OVERLAY_H / 2
+            self.canvas.create_oval(
+                cx - r, cy - r, cx + r, cy + r, fill="#cfcfcf", outline="",
             )
         elif self.mode == "error":
-            self.canvas.create_text(
-                OVERLAY_W / 2, OVERLAY_H / 2, text=self.message,
-                fill="#ff6b6b", font=("Segoe UI", 10, "bold"),
+            cx, cy = OVERLAY_W / 2, OVERLAY_H / 2
+            self.canvas.create_oval(
+                cx - 5, cy - 5, cx + 5, cy + 5, fill="#ff6b6b", outline="",
             )
 
     def _poll(self):

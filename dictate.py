@@ -79,55 +79,120 @@ def log_history(entry: dict) -> None:
         print(f"[dictate] history logging failed (non-fatal): {e}")
 
 
+OVERLAY_W, OVERLAY_H = 260, 70
+OVERLAY_CHROMA = "#ff00ff"  # arbitrary color keyed transparent; must never
+# appear in anything actually drawn, or that pixel becomes see-through too.
+OVERLAY_BG = "#1e1e1e"
+
+
 class Overlay:
-    """Tiny always-on-top indicator window. Runs on its own Tk mainloop
-    thread so it never blocks hotkey handling or transcription."""
+    """Tiny always-on-top waveform window with rounded corners. Runs on its
+    own Tk mainloop thread so it never blocks hotkey handling or
+    transcription. True rounded corners (not a rounded shape on a square
+    window) via -transparentcolor: everything outside the drawn rounded
+    rect is the chroma color, which Windows renders as see-through."""
 
     def __init__(self):
-        self._queue: "queue.Queue[str]" = queue.Queue()
+        self._mode_queue: "queue.Queue[tuple[str, str]]" = queue.Queue()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def _run(self):
+        self.mode = "hidden"
+        self.message = ""
+
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
-        self.label = tk.Label(
+        self.root.attributes("-transparentcolor", OVERLAY_CHROMA)
+        self.root.configure(bg=OVERLAY_CHROMA)
+
+        self.canvas = tk.Canvas(
             self.root,
-            text="",
-            font=("Segoe UI", 12, "bold"),
-            fg="white",
-            bg="#1e1e1e",
-            padx=16,
-            pady=8,
+            width=OVERLAY_W,
+            height=OVERLAY_H,
+            bg=OVERLAY_CHROMA,
+            highlightthickness=0,
         )
-        self.label.pack()
+        self.canvas.pack()
+
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
-        self.root.geometry(f"+{screen_w // 2 - 100}+{screen_h - 120}")
+        self.root.geometry(
+            f"{OVERLAY_W}x{OVERLAY_H}"
+            f"+{screen_w // 2 - OVERLAY_W // 2}+{screen_h - OVERLAY_H - 60}"
+        )
+
         self._poll()
         self.root.mainloop()
+
+    def _round_rect(self, x1, y1, x2, y2, radius, **kwargs):
+        points = [
+            x1 + radius, y1, x2 - radius, y1, x2, y1, x2, y1 + radius,
+            x2, y2 - radius, x2, y2, x2 - radius, y2, x1 + radius, y2,
+            x1, y2, x1, y2 - radius, x1, y1 + radius, x1, y1,
+        ]
+        return self.canvas.create_polygon(points, smooth=True, **kwargs)
+
+    def _draw(self):
+        self.canvas.delete("all")
+        self._round_rect(2, 2, OVERLAY_W - 2, OVERLAY_H - 2, 18, fill=OVERLAY_BG)
+
+        if self.mode == "listening":
+            levels = list(live_rms)
+            n = len(levels)
+            if n:
+                bar_w = (OVERLAY_W - 32) / n
+                peak = max(max(levels), QUIET_RMS_THRESHOLD * 2)
+                for i, lvl in enumerate(levels):
+                    h = min(1.0, lvl / peak) * (OVERLAY_H - 28) + 2
+                    active = lvl > QUIET_RMS_THRESHOLD
+                    color = "#4fd1c5" if active else "#4a4a4a"
+                    x0 = 16 + i * bar_w
+                    self.canvas.create_rectangle(
+                        x0, OVERLAY_H / 2 - h / 2,
+                        x0 + bar_w * 0.7, OVERLAY_H / 2 + h / 2,
+                        fill=color, outline="",
+                    )
+        elif self.mode == "transcribing":
+            self.canvas.create_text(
+                OVERLAY_W / 2, OVERLAY_H / 2, text="⏳ transcribing…",
+                fill="white", font=("Segoe UI", 11, "bold"),
+            )
+        elif self.mode == "error":
+            self.canvas.create_text(
+                OVERLAY_W / 2, OVERLAY_H / 2, text=self.message,
+                fill="#ff6b6b", font=("Segoe UI", 10, "bold"),
+            )
 
     def _poll(self):
         try:
             while True:
-                text = self._queue.get_nowait()
-                if text is None:
+                mode, message = self._mode_queue.get_nowait()
+                self.mode, self.message = mode, message
+                if mode == "hidden":
                     self.root.withdraw()
                 else:
-                    self.label.config(text=text)
                     self.root.deiconify()
                     self.root.lift()
         except queue.Empty:
             pass
-        self.root.after(50, self._poll)
+        if self.mode != "hidden":
+            self._draw()
+        self.root.after(40, self._poll)  # ~25fps, cheap enough for this size
 
-    def show(self, text: str):
-        self._queue.put(text)
+    def show_listening(self):
+        self._mode_queue.put(("listening", ""))
+
+    def show_transcribing(self):
+        self._mode_queue.put(("transcribing", ""))
+
+    def show_error(self, message: str):
+        self._mode_queue.put(("error", message))
 
     def hide(self):
-        self._queue.put(None)
+        self._mode_queue.put(("hidden", ""))
 
 
 def normalize_audio(samples: np.ndarray, target_peak: float = 0.9) -> np.ndarray:
@@ -300,7 +365,7 @@ def start_recording():
 
     current_session = RecordingSession()
     session = current_session
-    overlay.show("🎙  Listening…")
+    overlay.show_listening()
 
     def callback(indata, frames, time_info, status):
         result = session.add_block(indata.copy().reshape(-1))
@@ -332,7 +397,7 @@ def stop_recording():
         stream.stop()
         stream.close()
 
-    overlay.show("⏳  Transcribing…")
+    overlay.show_transcribing()
 
     final = session.flush_final()
     if final is not None:
@@ -346,13 +411,19 @@ def stop_recording():
         session.all_done.set()
 
     def wait_and_paste():
+        global last_dictation
         session.all_done.wait(timeout=60)
         text = session.joined_text()
         if text:
             print(f"[dictate] full dictation: {text!r}")
             last_dictation = text
             paste(text)
-        overlay.hide()
+            overlay.hide()
+        else:
+            print("[dictate] nothing transcribed for this recording")
+            overlay.show_error("⚠  nothing transcribed")
+            time.sleep(1.5)
+            overlay.hide()
 
     threading.Thread(target=wait_and_paste, daemon=True).start()
 

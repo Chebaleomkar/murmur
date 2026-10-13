@@ -11,6 +11,7 @@ A small always-on-top window appears while recording so you can see the mic
 is actually listening — that's the only acknowledgment; no sounds.
 """
 
+import datetime as dt
 import json
 import queue
 import subprocess
@@ -29,6 +30,21 @@ NEEDLE_BIN = Path(r"E:\windows-x86_64\needle.exe")
 MODEL_PATH = Path(r"E:\whistle.cact")
 SAMPLE_RATE = 16000
 MAX_RECORD_SECONDS = 28  # Whistle's engine caps at 30s; stop a little early.
+
+HISTORY_DIR = Path(__file__).resolve().parent / "history"
+TRANSCRIPTS_LOG = HISTORY_DIR / "transcripts.jsonl"
+
+
+def log_history(entry: dict) -> None:
+    """Append one line per recording so every dictation + its audio is kept
+    for building a personal dataset later. Never raises — a logging failure
+    shouldn't break dictation itself."""
+    try:
+        HISTORY_DIR.mkdir(exist_ok=True)
+        with open(TRANSCRIPTS_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError as e:
+        print(f"[dictate] history logging failed (non-fatal): {e}")
 
 state_lock = threading.Lock()
 is_recording = False
@@ -205,15 +221,23 @@ def stop_recording(stream=None):
               "device/mute/privacy settings, this is likely why transcription "
               "is wrong")
 
-    # Kept (not deleted) on purpose right now so a bad capture can be
-    # inspected after the fact instead of guessing from the transcript alone.
-    tmp_wav = Path.cwd() / "last_recording.wav"
+    session_id = dt.datetime.now().strftime("%Y%m%dT%H%M%S")
+    HISTORY_DIR.mkdir(exist_ok=True)
+    wav_path = HISTORY_DIR / f"{session_id}.wav"
     try:
-        save_wav(tmp_wav, samples)
-        text = transcribe(tmp_wav)
+        save_wav(wav_path, samples)
+        text = transcribe(wav_path)
         print(f"[dictate] text: {text!r}")
         last_dictation = text
         paste(text)
+        log_history({
+            "ts": session_id,
+            "wav": wav_path.name,
+            "duration_s": round(duration, 2),
+            "peak": round(peak, 4),
+            "rms": round(rms, 4),
+            "text": text,
+        })
         overlay.hide()
     except Exception as e:
         print(f"[dictate] ERROR: {e}")

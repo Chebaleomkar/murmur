@@ -3,3 +3,6 @@ __pycache__/
 last_recording.wav
 history/
 .venv/
+build/
+dist/
+*.spec

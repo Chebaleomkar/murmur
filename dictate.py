@@ -21,6 +21,7 @@ import datetime as dt
 import json
 import queue
 import subprocess
+import sys
 import threading
 import time
 import wave
@@ -77,7 +78,10 @@ def count_voiced_blocks(samples: np.ndarray) -> int:
     block_rms = np.sqrt(np.mean(blocks**2, axis=1))
     return int(np.sum(block_rms > VOICED_RMS_THRESHOLD))
 
-HISTORY_DIR = Path(__file__).resolve().parent / "history"
+# A PyInstaller .exe runs from a temp folder that is deleted on exit, so keep
+# history next to the .exe instead.
+APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+HISTORY_DIR = APP_DIR / "history"
 TRANSCRIPTS_LOG = HISTORY_DIR / "transcripts.jsonl"
 
 state_lock = threading.Lock()

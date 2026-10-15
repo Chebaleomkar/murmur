@@ -48,11 +48,20 @@ def _find(*candidates: Path) -> Path:
     return candidates[0]
 
 
+if WINDOWS:
+    ENGINE_DIR, NEEDLE_NAME = "windows-x86_64", "needle.exe"
+elif sys.platform == "darwin":
+    ENGINE_DIR, NEEDLE_NAME = "macos-arm64", "needle"
+else:
+    ENGINE_DIR, NEEDLE_NAME = "linux-x86_64", "needle"
+
 NEEDLE_BIN = _find(
-    APP_DIR / ("needle.exe" if WINDOWS else "needle"),
+    APP_DIR / "engines" / ENGINE_DIR / NEEDLE_NAME,
+    APP_DIR / NEEDLE_NAME,
     *([Path(r"E:\windows-x86_64\needle.exe")] if WINDOWS else []),
 )
 MODEL_PATH = _find(
+    APP_DIR / "models" / "whistle.cact",
     APP_DIR / "whistle.cact",
     *([Path(r"E:\whistle.cact")] if WINDOWS else []),
 )

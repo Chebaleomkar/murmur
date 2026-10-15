@@ -13,13 +13,13 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            needle: windows-x86_64
+            engine: windows-x86_64
             needle_bin: needle.exe
           - os: ubuntu-latest
-            needle: linux-x86_64
+            engine: linux-x86_64
             needle_bin: needle
           - os: macos-latest
-            needle: macos-arm64
+            engine: macos-arm64
             needle_bin: needle
     runs-on: ${{ matrix.os }}
     steps:
@@ -31,13 +31,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install -r requirements.txt pyinstaller cactus-needle
-
-      - name: Fetch needle engine and Whistle weights
-        shell: bash
-        run: |
-          needle download ${{ matrix.needle }}
-          needle download whistle
+          python -m pip install -r requirements.txt pyinstaller
 
       - name: Build executable
         shell: bash
@@ -50,10 +44,10 @@ jobs:
         run: |
           mkdir bundle
           cp -R dist/Murmur* bundle/
-          cp "${{ matrix.needle }}/${{ matrix.needle_bin }}" bundle/
-          cp whistle.cact bundle/
+          cp "engines/${{ matrix.engine }}/${{ matrix.needle_bin }}" bundle/
+          cp models/whistle.cact bundle/
 
       - uses: actions/upload-artifact@v4
         with:
-          name: murmur-${{ matrix.needle }}
+          name: murmur-${{ matrix.engine }}
           path: bundle/*

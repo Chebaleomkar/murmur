@@ -19,12 +19,10 @@ history/transcripts.jsonl, for building a personal dataset over time.
 import collections
 import datetime as dt
 import json
-import math
 import queue
 import subprocess
 import threading
 import time
-import tkinter as tk
 import wave
 from pathlib import Path
 
@@ -32,6 +30,8 @@ import keyboard
 import numpy as np
 import pyperclip
 import sounddevice as sd
+
+from overlay import Overlay
 
 NEEDLE_BIN = Path(r"E:\windows-x86_64\needle.exe")
 MODEL_PATH = Path(r"E:\whistle.cact")
@@ -63,6 +63,10 @@ QUIET_RMS_THRESHOLD = 0.004
 # RMS clears this threshold and only transcribe once enough of them do.
 VOICED_RMS_THRESHOLD = 0.01
 MIN_VOICED_BLOCKS = 3  # ~300ms of sustained energy, not a single spike
+# Clips under a second were noise in practice (taps, breaths) and the model
+# turned them into "Thank you." or other junk. Tradeoff: a short final word
+# after a pause can be dropped too.
+MIN_SPEECH_SECONDS = 1.0
 
 
 def count_voiced_blocks(samples: np.ndarray) -> int:
@@ -80,13 +84,28 @@ state_lock = threading.Lock()
 is_recording = False
 last_dictation = ""
 overlay = None
-live_rms = collections.deque(maxlen=50)  # read by the (future) waveform UI
+live_rms = collections.deque(maxlen=50)  # read by the overlay waveform
 
-TOGGLE_COOLDOWN = 0.75  # seconds; the Windows key doesn't send clean key-up
-# events, so `keyboard` can fire a hotkey callback more than once per actual
-# press. Without this, one press could start-then-immediately-stop a
-# recording, or two presses could collapse into a no-op.
-_last_toggle_time = 0.0
+DICTATE_HOTKEYS = ("ctrl+windows", "f9")  # hold to talk; change here to rebind
+# Keys whose release ends a hold. Releasing any of them stops recording.
+DICTATE_RELEASE_KEYS = ("ctrl", "windows", "f9")
+REPASTE_HOTKEY = "ctrl+alt+z"
+
+
+MURMUR_LOG = HISTORY_DIR / "murmur.log"
+
+
+def log(message: str) -> None:
+    """Under pythonw there is no stdout, so print() silently does nothing.
+    Also append to a file so failures leave a record."""
+    line = f"{dt.datetime.now().isoformat(timespec='seconds')} {message}"
+    print(line)
+    try:
+        HISTORY_DIR.mkdir(exist_ok=True)
+        with open(MURMUR_LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
 
 
 def log_history(entry: dict) -> None:
@@ -98,131 +117,7 @@ def log_history(entry: dict) -> None:
         with open(TRANSCRIPTS_LOG, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except OSError as e:
-        print(f"[dictate] history logging failed (non-fatal): {e}")
-
-
-OVERLAY_W, OVERLAY_H = 108, 30  # small chip, not a panel — WhisperFlow/Handy-sized
-OVERLAY_RADIUS = OVERLAY_H // 2  # true pill/stadium shape, not just rounded corners
-OVERLAY_CHROMA = "#ff00ff"  # arbitrary color keyed transparent; must never
-# appear in anything actually drawn, or that pixel becomes see-through too.
-OVERLAY_BG = "#1e1e1e"
-
-
-class Overlay:
-    """Tiny always-on-top pill-shaped indicator. Runs on its own Tk mainloop
-    thread so it never blocks hotkey handling or transcription. True rounded
-    corners (not a rounded shape on a square window) via -transparentcolor:
-    everything outside the drawn pill is the chroma color, which Windows
-    renders as see-through."""
-
-    def __init__(self):
-        self._mode_queue: "queue.Queue[tuple[str, str]]" = queue.Queue()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def _run(self):
-        self.mode = "hidden"
-        self.message = ""
-
-        self.root = tk.Tk()
-        self.root.withdraw()
-        self.root.overrideredirect(True)
-        self.root.attributes("-topmost", True)
-        self.root.attributes("-transparentcolor", OVERLAY_CHROMA)
-        self.root.configure(bg=OVERLAY_CHROMA)
-
-        self.canvas = tk.Canvas(
-            self.root,
-            width=OVERLAY_W,
-            height=OVERLAY_H,
-            bg=OVERLAY_CHROMA,
-            highlightthickness=0,
-        )
-        self.canvas.pack()
-
-        screen_w = self.root.winfo_screenwidth()
-        screen_h = self.root.winfo_screenheight()
-        self.root.geometry(
-            f"{OVERLAY_W}x{OVERLAY_H}"
-            f"+{screen_w // 2 - OVERLAY_W // 2}+{screen_h - OVERLAY_H - 60}"
-        )
-
-        self._poll()
-        self.root.mainloop()
-
-    def _round_rect(self, x1, y1, x2, y2, radius, **kwargs):
-        points = [
-            x1 + radius, y1, x2 - radius, y1, x2, y1, x2, y1 + radius,
-            x2, y2 - radius, x2, y2, x2 - radius, y2, x1 + radius, y2,
-            x1, y2, x1, y2 - radius, x1, y1 + radius, x1, y1,
-        ]
-        return self.canvas.create_polygon(points, smooth=True, **kwargs)
-
-    BAR_COUNT = 7
-
-    def _draw(self):
-        self.canvas.delete("all")
-        self._round_rect(1, 1, OVERLAY_W - 1, OVERLAY_H - 1, OVERLAY_RADIUS, fill=OVERLAY_BG)
-
-        if self.mode == "listening":
-            levels = list(live_rms)[-self.BAR_COUNT:]
-            n = len(levels)
-            if n:
-                gap = 3
-                bar_w = (OVERLAY_W - 20 - gap * (n - 1)) / n
-                peak = max(max(levels), QUIET_RMS_THRESHOLD * 2)
-                for i, lvl in enumerate(levels):
-                    h = min(1.0, lvl / peak) * (OVERLAY_H - 12) + 3
-                    active = lvl > QUIET_RMS_THRESHOLD
-                    color = "#4fd1c5" if active else "#5a5a5a"
-                    x0 = 10 + i * (bar_w + gap)
-                    self.canvas.create_rectangle(
-                        x0, OVERLAY_H / 2 - h / 2,
-                        x0 + bar_w, OVERLAY_H / 2 + h / 2,
-                        fill=color, outline="",
-                    )
-        elif self.mode == "transcribing":
-            # Small pulsing dot — a spinner would need more room than this
-            # chip has.
-            pulse = (time.time() * 3) % (2 * math.pi)
-            r = 4 + 2 * abs(math.sin(pulse))
-            cx, cy = OVERLAY_W / 2, OVERLAY_H / 2
-            self.canvas.create_oval(
-                cx - r, cy - r, cx + r, cy + r, fill="#cfcfcf", outline="",
-            )
-        elif self.mode == "error":
-            cx, cy = OVERLAY_W / 2, OVERLAY_H / 2
-            self.canvas.create_oval(
-                cx - 5, cy - 5, cx + 5, cy + 5, fill="#ff6b6b", outline="",
-            )
-
-    def _poll(self):
-        try:
-            while True:
-                mode, message = self._mode_queue.get_nowait()
-                self.mode, self.message = mode, message
-                if mode == "hidden":
-                    self.root.withdraw()
-                else:
-                    self.root.deiconify()
-                    self.root.lift()
-        except queue.Empty:
-            pass
-        if self.mode != "hidden":
-            self._draw()
-        self.root.after(40, self._poll)  # ~25fps, cheap enough for this size
-
-    def show_listening(self):
-        self._mode_queue.put(("listening", ""))
-
-    def show_transcribing(self):
-        self._mode_queue.put(("transcribing", ""))
-
-    def show_error(self, message: str):
-        self._mode_queue.put(("error", message))
-
-    def hide(self):
-        self._mode_queue.put(("hidden", ""))
+        log(f"[dictate] history logging failed (non-fatal): {e}")
 
 
 def normalize_audio(samples: np.ndarray, target_peak: float = 0.9) -> np.ndarray:
@@ -253,6 +148,9 @@ def transcribe(wav_path: Path) -> str:
         [str(NEEDLE_BIN), "--model", str(MODEL_PATH), "--audio", str(wav_path)],
         capture_output=True,
         timeout=30,
+        # Under pythonw there is no parent console, so Windows would pop a
+        # new console window for every needle.exe run (once per chunk).
+        creationflags=subprocess.CREATE_NO_WINDOW,
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.decode("utf-8", "replace"))
@@ -264,6 +162,11 @@ def paste(text: str) -> None:
     if not text:
         return
     pyperclip.copy(text)
+    # The re-paste hotkey (Ctrl+Alt+Z) can still have its modifiers down when
+    # the paste fires, and Win+Ctrl+V opens Windows' Sound output flyout.
+    # Release the modifiers first.
+    keyboard.release("windows")
+    keyboard.release("ctrl")
     keyboard.send("ctrl+v")
 
 
@@ -291,18 +194,21 @@ class ChunkWorker:
             rms = float(np.sqrt(np.mean(samples**2))) if len(samples) else 0.0
             wav_path = session.dir / f"chunk_{index:03d}.wav"
             text = ""
-            voiced_blocks = count_voiced_blocks(samples)
-            if voiced_blocks < MIN_VOICED_BLOCKS:
-                print(f"[dictate] chunk {index} ({duration:.1f}s): skipped, "
-                      f"only {voiced_blocks} voiced block(s)")
+            # Check speech on the boosted audio: quiet real speech otherwise
+            # fails the block count, and save_wav boosts it anyway.
+            boosted = normalize_audio(samples)
+            voiced_blocks = count_voiced_blocks(boosted)
+            if duration < MIN_SPEECH_SECONDS or voiced_blocks < MIN_VOICED_BLOCKS:
+                log(f"[dictate] chunk {index} ({duration:.1f}s): skipped, "
+                      f"{voiced_blocks} voiced block(s)")
                 save_wav(wav_path, samples)  # keep in history for debugging
             else:
                 try:
                     save_wav(wav_path, samples)
                     text = transcribe(wav_path)
-                    print(f"[dictate] chunk {index} ({duration:.1f}s): {text!r}")
+                    log(f"[dictate] chunk {index} ({duration:.1f}s): {text!r}")
                 except Exception as e:
-                    print(f"[dictate] chunk {index} ERROR: {e}")
+                    log(f"[dictate] chunk {index} ERROR: {e}")
             log_history({
                 "ts": dt.datetime.now().isoformat(timespec="seconds"),
                 "session": session.id,
@@ -464,12 +370,12 @@ def stop_recording():
         session.all_done.wait(timeout=60)
         text = session.joined_text()
         if text:
-            print(f"[dictate] full dictation: {text!r}")
+            log(f"[dictate] full dictation: {text!r}")
             last_dictation = text
             paste(text)
             overlay.hide()
         else:
-            print("[dictate] nothing transcribed for this recording")
+            log("[dictate] nothing transcribed for this recording")
             overlay.show_error("⚠  nothing transcribed")
             time.sleep(1.5)
             overlay.hide()
@@ -477,25 +383,57 @@ def stop_recording():
     threading.Thread(target=wait_and_paste, daemon=True).start()
 
 
-def toggle_recording():
-    global _last_toggle_time
-    now = time.monotonic()
-    if now - _last_toggle_time < TOGGLE_COOLDOWN:
+class HotkeyController:
+    """DICTATE_HOTKEYS: hold to talk, release to stop. Windows auto-repeats a
+    held key, so repeated presses while held are ignored."""
+
+    def __init__(self, start, stop):
+        self._start, self._stop = start, stop
+        self._held = False
+
+    def press(self):
+        if self._held:
+            return
+        self._held = True
+        self._start()
+
+    def release(self):
+        if not self._held:
+            return
+        self._held = False
+        self._stop()
+
+
+def dictate_latest_recording():
+    """Transcribe and paste the most recent saved recording from history."""
+    sessions = sorted(p for p in HISTORY_DIR.glob("*") if p.is_dir())
+    if not sessions:
+        log("[dictate] no saved recordings yet")
         return
-    _last_toggle_time = now
+    chunks = sorted(sessions[-1].glob("chunk_*.wav"))
+    threading.Thread(target=_transcribe_and_paste, args=(chunks,), daemon=True).start()
 
-    if is_recording:
-        stop_recording()
+
+def _transcribe_and_paste(chunks):
+    global last_dictation
+    overlay.show_transcribing()
+    texts = []
+    for chunk in chunks:
+        try:
+            texts.append(transcribe(chunk))
+        except Exception as e:
+            log(f"[dictate] re-transcribe {chunk.name} ERROR: {e}")
+    text = " ".join(t for t in texts if t)
+    if text:
+        log(f"[dictate] re-transcribed latest: {text!r}")
+        last_dictation = text
+        paste(text)
+        overlay.hide()
     else:
-        start_recording()
-
-
-def repaste_last():
-    if last_dictation:
-        print(f"[dictate] re-pasting: {last_dictation!r}")
-        paste(last_dictation)
-    else:
-        print("[dictate] no previous dictation yet")
+        log("[dictate] nothing transcribed from latest recording")
+        overlay.show_error("nothing transcribed")
+        time.sleep(1.5)
+        overlay.hide()
 
 
 def main():
@@ -505,18 +443,22 @@ def main():
     if not MODEL_PATH.is_file():
         raise SystemExit(f"whistle.cact not found at {MODEL_PATH}")
 
-    overlay = Overlay()
+    overlay = Overlay(lambda: list(live_rms), QUIET_RMS_THRESHOLD)
     chunk_worker = ChunkWorker()
 
-    keyboard.add_hotkey("ctrl+windows", toggle_recording)
-    keyboard.add_hotkey("alt+z", repaste_last)
+    hotkey = HotkeyController(start_recording, stop_recording)
+    for combo in DICTATE_HOTKEYS:
+        keyboard.add_hotkey(combo, hotkey.press)
+    for key in DICTATE_RELEASE_KEYS:
+        keyboard.on_release_key(key, lambda e: hotkey.release())
+    keyboard.add_hotkey(REPASTE_HOTKEY, dictate_latest_recording)
 
-    print("[dictate] ready — Ctrl+Win to dictate, Alt+Z to re-paste last result")
-    print("[dictate] press Ctrl+C in this window to quit")
+    log(f"[dictate] ready: hold {' or '.join(DICTATE_HOTKEYS)} to talk; {REPASTE_HOTKEY} dictates the latest recording")
     try:
-        keyboard.wait()
+        overlay.exec()  # Qt needs the main thread; hotkeys run in their own
     except KeyboardInterrupt:
-        print("[dictate] bye")
+        pass
+    print("[dictate] bye")
 
 
 if __name__ == "__main__":

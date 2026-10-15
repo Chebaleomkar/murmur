@@ -2,3 +2,4 @@ keyboard
 sounddevice
 pyperclip
 numpy
+PySide6

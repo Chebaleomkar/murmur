@@ -1,0 +1,57 @@
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            needle: windows-x86_64
+            needle_bin: needle.exe
+          - os: ubuntu-latest
+            needle: linux-x86_64
+            needle_bin: needle
+          - os: macos-latest
+            needle: macos-arm64
+            needle_bin: needle
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt pyinstaller cactus-needle
+
+      - name: Fetch needle engine and Whistle weights
+        shell: bash
+        run: |
+          needle download ${{ matrix.needle }}
+          needle download whistle
+
+      - name: Build executable
+        run: |
+          pyinstaller --noconfirm --onefile --noconsole --name Murmur \
+            --collect-submodules pynput dictate.py
+
+      - name: Assemble bundle
+        shell: bash
+        run: |
+          mkdir bundle
+          cp dist/Murmur* bundle/
+          cp "${{ matrix.needle }}/${{ matrix.needle_bin }}" bundle/
+          cp whistle.cact bundle/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: murmur-${{ matrix.needle }}
+          path: bundle/*

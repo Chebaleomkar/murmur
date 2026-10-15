@@ -27,15 +27,35 @@ import time
 import wave
 from pathlib import Path
 
-import keyboard
 import numpy as np
 import pyperclip
 import sounddevice as sd
 
+import hotkeys
 from overlay import Overlay
 
-NEEDLE_BIN = Path(r"E:\windows-x86_64\needle.exe")
-MODEL_PATH = Path(r"E:\whistle.cact")
+WINDOWS = sys.platform == "win32"
+# A PyInstaller build runs from a temp folder that is deleted on exit, so
+# history lives next to the executable instead.
+APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+
+
+def _find(*candidates: Path) -> Path:
+    """First candidate that exists, else the first one (main() reports it)."""
+    for path in candidates:
+        if path.is_file():
+            return path
+    return candidates[0]
+
+
+NEEDLE_BIN = _find(
+    APP_DIR / ("needle.exe" if WINDOWS else "needle"),
+    *([Path(r"E:\windows-x86_64\needle.exe")] if WINDOWS else []),
+)
+MODEL_PATH = _find(
+    APP_DIR / "whistle.cact",
+    *([Path(r"E:\whistle.cact")] if WINDOWS else []),
+)
 SAMPLE_RATE = 16000
 
 BLOCK_SECONDS = 0.1
@@ -77,10 +97,6 @@ def count_voiced_blocks(samples: np.ndarray) -> int:
     blocks = samples[:usable_len].reshape(-1, BLOCK_SIZE)
     block_rms = np.sqrt(np.mean(blocks**2, axis=1))
     return int(np.sum(block_rms > VOICED_RMS_THRESHOLD))
-
-# A PyInstaller .exe runs from a temp folder that is deleted on exit, so keep
-# history next to the .exe instead.
-APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 HISTORY_DIR = APP_DIR / "history"
 TRANSCRIPTS_LOG = HISTORY_DIR / "transcripts.jsonl"
 
@@ -154,7 +170,7 @@ def transcribe(wav_path: Path) -> str:
         timeout=30,
         # Under pythonw there is no parent console, so Windows would pop a
         # new console window for every needle.exe run (once per chunk).
-        creationflags=subprocess.CREATE_NO_WINDOW,
+        creationflags=subprocess.CREATE_NO_WINDOW if WINDOWS else 0,
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.decode("utf-8", "replace"))
@@ -166,12 +182,7 @@ def paste(text: str) -> None:
     if not text:
         return
     pyperclip.copy(text)
-    # The re-paste hotkey (Ctrl+Alt+Z) can still have its modifiers down when
-    # the paste fires, and Win+Ctrl+V opens Windows' Sound output flyout.
-    # Release the modifiers first.
-    keyboard.release("windows")
-    keyboard.release("ctrl")
-    keyboard.send("ctrl+v")
+    hotkeys.send_paste()
 
 
 class ChunkWorker:
@@ -451,11 +462,11 @@ def main():
     chunk_worker = ChunkWorker()
 
     hotkey = HotkeyController(start_recording, stop_recording)
-    for combo in DICTATE_HOTKEYS:
-        keyboard.add_hotkey(combo, hotkey.press)
-    for key in DICTATE_RELEASE_KEYS:
-        keyboard.on_release_key(key, lambda e: hotkey.release())
-    keyboard.add_hotkey(REPASTE_HOTKEY, dictate_latest_recording)
+    hotkeys.start(
+        DICTATE_HOTKEYS, DICTATE_RELEASE_KEYS, REPASTE_HOTKEY,
+        on_press=hotkey.press, on_release=hotkey.release,
+        repaste=dictate_latest_recording,
+    )
 
     log(f"[dictate] ready: hold {' or '.join(DICTATE_HOTKEYS)} to talk; {REPASTE_HOTKEY} dictates the latest recording")
     try:

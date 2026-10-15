@@ -3,3 +3,4 @@ sounddevice
 pyperclip
 numpy
 PySide6
+pynput; platform_system != "Windows"

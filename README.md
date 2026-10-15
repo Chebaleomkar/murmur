@@ -77,3 +77,15 @@ working directory set to this folder) in your Startup folder.
 - If a hotkey doesn't register, try running from a terminal opened as
   Administrator. The `keyboard` library's handling of the Windows key can
   need elevated privileges on some setups.
+
+## Platforms
+
+- **Windows:** `pyinstaller --noconfirm --onefile --noconsole --name Murmur dictate.py`
+  builds `dist\Murmur.exe`. Put `needle.exe` and `whistle.cact` next to it, or
+  they are looked for in `E:\` as before.
+- **macOS and Linux:** hotkeys and the paste keystroke use `pynput`. On macOS,
+  grant the terminal or the built app Accessibility and Input Monitoring
+  permission. On Linux, pynput needs an X11 session; Wayland doesn't allow
+  global hotkeys.
+- **Builds for all three:** `.github/workflows/build.yml` runs on GitHub
+  Actions and uploads a bundle per OS. Those builds have not been run yet.
